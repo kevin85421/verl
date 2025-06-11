@@ -715,7 +715,8 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
                 with patch.dict(os.environ, {"DISABLE_WORKER_INIT": "1"}):
                     self.worker_dict[key] = user_defined_cls(*init_args_dict[key].get("args", ()), **init_args_dict[key].get("kwargs", {}))
 
-        def prepare_state_dict(self):
+        @ray.method(tensor_transport="NCCL")
+        def get_local_shards(self):
             try:
                 # for torch 2.5+
                 from torch.distributed.tensor import DTensor
@@ -724,7 +725,7 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
             import torch
             rank = torch.distributed.get_rank()
 
-            print(f"prepare_state_dict, rank {rank}")
+            print(f"get_local_shards, rank {rank}")
 
             # Same as `__enter__` in `FSDPVLLMShardingManager`
             from verl.utils.device import get_torch_device
@@ -732,15 +733,14 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
 
             rollout_sharding_manager = self.worker_dict["actor_rollout"].rollout_sharding_manager
             params = rollout_sharding_manager.module.state_dict()
+            if rank == 0:
+                self.cached_params = params
 
-            if rank != 0:
-                local_params = {}
-                for name, param in params.items():
-                    if isinstance(param, DTensor):
-                        local_params[name] = param.to_local()
-                return local_params
-            else:
-                self.tmp_params = params
+            local_params = {}
+            for name, param in params.items():
+                if isinstance(param, DTensor):
+                    local_params[name] = param.to_local()
+            return local_params
 
         @ray.method(tensor_transport="NCCL")
         def gather_params(self, *args, **kwargs):
@@ -750,69 +750,38 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
             except ImportError:
                 from torch.distributed._tensor import DTensor
             import torch
-            assert torch.distributed.get_rank() == 0, "gather_params should only be called by rank 0"
-            print(f"gather_params, rank {torch.distributed.get_rank()}")
+
+            rank = torch.distributed.get_rank()
+            assert rank == 0, "gather_params should only be called by rank 0"
+            print(f"gather_params, rank {rank}")
             # If `arg` is (int, Dict[str, torch.Tensor]), `arg` will be object ref here.
             gathered = {}
-            local_rank = torch.distributed.get_rank()
-            # Put remote shards into gathered
-            world_size = len(args) + 1
-            for index, shards in enumerate(args):
-                rank = index if index < local_rank else index + 1
+            # Put shards into gathered
+            world_size = len(args)
+            for rank, shards in enumerate(args):
                 for name, shard in shards.items():
                     if name not in gathered:
                         gathered[name] = [torch.empty_like(shard) for _ in range(world_size)]
                     gathered[name][rank] = shard
 
-            # Put local shards into gathered
-            for name, param in self.tmp_params.items():
-                if name in gathered:
-                    gathered[name][local_rank] = param.to_local()
-
             from verl.utils.device import get_torch_device
             device = get_torch_device().current_device()
 
-            self.params = []
-            for name, param in self.tmp_params.items():
+            params = []
+            for name, param in self.cached_params.items():
                 if name in gathered:
                     assert isinstance(param, DTensor), f"param {name} is not a DTensor, but in gathered"
-                    self.params.append((name, torch.cat(gathered[name], dim=0).to(device)))
+                    params.append((name, torch.cat(gathered[name], dim=0).to(device)))
                 else:
-                    self.params.append((name, param.to(device)))
+                    params.append((name, param.to(device)))
+            del self.cached_params
+            return params
 
-            del self.tmp_params
 
-            # param_metadata_list = []
-            # for name, param in self.params:
-            #     param_metadata_list.append((name, param.shape, param.dtype))
-            # return param_metadata_list
-            return self.params
-
-        def broadcast_params_and_sync_weights(self, *args):
+        def sync_weights(self, params):
             import torch
             rank = torch.distributed.get_rank()
-            print(f"broadcast_params_and_sync_weights, rank {rank}")
-
-            if rank != 0:
-                self.params = args[0]
-
-            # from verl.utils.device import get_torch_device
-            # device = get_torch_device().current_device()
-
-            # if rank == 0:
-            #     for name, param in self.params:
-            #         assert isinstance(param, torch.Tensor), f"param {name} is not a torch.Tensor, but in params"
-            #         torch.distributed.broadcast(param, src=0)
-            # else:
-            #     assert not hasattr(self, "params"), "params should not exist in non-rank 0 before broadcast_params"
-            #     self.params = []
-            #     for param_metadata in param_metadata_list:
-            #         name, shape, dtype = param_metadata
-            #         param = torch.zeros(shape, dtype=dtype, device=device)
-            #         torch.distributed.broadcast(param, src=0)
-            #         self.params.append((name, param))
-
-            print(f"broadcast_params_and_sync_weights, rank {rank}, broadcast done, params: {len(self.params)}")
+            print(f"sync_weights, rank {rank}, broadcast done, params: {len(params)}")
 
             rollout_sharding_manager = self.worker_dict["actor_rollout"].rollout_sharding_manager
 
@@ -821,12 +790,16 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
             rollout_sharding_manager.inference_engine.wake_up()
             
             model = rollout_sharding_manager.model_runner.model
-            print("broadcast_params_and_sync_weights load_weights")
-            model.load_weights(self.params)
-            print("broadcast_params_and_sync_weights load_weights done")
+            print("sync_weights load_weights")
+            model.load_weights(params)
+            print("sync_weights load_weights done")
 
-            del self.params
-
+        def clear_gpu_cache(self):
+            print("clear_gpu_cache")
+            # A hack to garbage collect the GPU objects
+            gpu_object_manager = ray._private.worker.global_worker.gpu_object_manager
+            gpu_object_manager.gpu_object_store = {}
+            gpu_object_manager.gpu_object_refs = {}
 
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
