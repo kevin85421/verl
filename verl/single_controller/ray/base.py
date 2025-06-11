@@ -702,6 +702,10 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     class WorkerDict(worker_cls):
         def __init__(self):
             super().__init__()
+
+            print("register_custom_serializer")
+            from ray.experimental.channel.torch_tensor_type import TorchTensorType
+            TorchTensorType().register_custom_serializer()
             self.worker_dict = {}
             for key, user_defined_cls in cls_dict.items():
                 user_defined_cls = _unwrap_ray_remote(user_defined_cls)
@@ -711,7 +715,92 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
                 with patch.dict(os.environ, {"DISABLE_WORKER_INIT": "1"}):
                     self.worker_dict[key] = user_defined_cls(*init_args_dict[key].get("args", ()), **init_args_dict[key].get("kwargs", {}))
 
-    # now monkey-patch the methods from inner class to WorkerDict
+        @ray.method(tensor_transport="NCCL")
+        def get_local_shards(self):
+            try:
+                # for torch 2.5+
+                from torch.distributed.tensor import DTensor
+            except ImportError:
+                from torch.distributed._tensor import DTensor
+            import torch
+            rank = torch.distributed.get_rank()
+
+            print(f"get_local_shards, rank {rank}")
+
+            # Same as `__enter__` in `FSDPVLLMShardingManager`
+            from verl.utils.device import get_torch_device
+            get_torch_device().empty_cache()
+
+            rollout_sharding_manager = self.worker_dict["actor_rollout"].rollout_sharding_manager
+            params = rollout_sharding_manager.module.state_dict()
+            if rank == 0:
+                self.cached_params = params
+
+            local_params = {}
+            for name, param in params.items():
+                if isinstance(param, DTensor):
+                    local_params[name] = param.to_local()
+            return local_params
+
+        @ray.method(tensor_transport="NCCL")
+        def gather_params(self, *args, **kwargs):
+            try:
+                # for torch 2.5+
+                from torch.distributed.tensor import DTensor
+            except ImportError:
+                from torch.distributed._tensor import DTensor
+            import torch
+
+            rank = torch.distributed.get_rank()
+            assert rank == 0, "gather_params should only be called by rank 0"
+            print(f"gather_params, rank {rank}")
+            # If `arg` is (int, Dict[str, torch.Tensor]), `arg` will be object ref here.
+            gathered = {}
+            # Put shards into gathered
+            world_size = len(args)
+            for rank, shards in enumerate(args):
+                for name, shard in shards.items():
+                    if name not in gathered:
+                        gathered[name] = [torch.empty_like(shard) for _ in range(world_size)]
+                    gathered[name][rank] = shard
+
+            from verl.utils.device import get_torch_device
+            device = get_torch_device().current_device()
+
+            params = []
+            for name, param in self.cached_params.items():
+                if name in gathered:
+                    assert isinstance(param, DTensor), f"param {name} is not a DTensor, but in gathered"
+                    params.append((name, torch.cat(gathered[name], dim=0).to(device)))
+                else:
+                    params.append((name, param.to(device)))
+            del self.cached_params
+            return params
+
+
+        def sync_weights(self, params):
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"sync_weights, rank {rank}, broadcast done, params: {len(params)}")
+
+            rollout_sharding_manager = self.worker_dict["actor_rollout"].rollout_sharding_manager
+
+            # wake up inference engine to load weights.
+            # Without `wake_up`, `load_weights` will fail because of accessing invalid memory.
+            rollout_sharding_manager.inference_engine.wake_up()
+            
+            model = rollout_sharding_manager.model_runner.model
+            print("sync_weights load_weights")
+            model.load_weights(params)
+            print("sync_weights load_weights done")
+
+        def clear_gpu_cache(self):
+            print("clear_gpu_cache")
+            # A hack to garbage collect the GPU objects
+            gpu_object_manager = ray._private.worker.global_worker.gpu_object_manager
+            gpu_object_manager.gpu_object_store = {}
+            gpu_object_manager.gpu_object_refs = {}
+
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
         _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
